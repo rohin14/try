@@ -1,0 +1,669 @@
+// File structure:
+// - netlify/functions/process-pdf.js (serverless function)
+// - netlify/functions/query-rag.js (serverless function)
+// - src/App.js (main React component)
+// - public/index.html (HTML template)
+// - package.json (dependencies)
+// - netlify.toml (Netlify configuration)
+
+// netlify/functions/process-pdf.js
+// This serverless function will handle PDF processing and embeddings
+const { PDFLoader } = require("langchain/document_loaders/fs/pdf");
+const { RecursiveCharacterTextSplitter } = require("langchain/text_splitter");
+const { FaissStore } = require("langchain/vectorstores/faiss");
+const { HuggingFaceTransformersEmbeddings } = require("langchain/embeddings/hf_transformers");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { promisify } = require("util");
+const writeFile = promisify(fs.writeFile);
+const mkdir = promisify(fs.mkdir);
+const unlink = promisify(fs.unlink);
+
+exports.handler = async (event, context) => {
+  try {
+    if (event.httpMethod !== "POST") {
+      return { statusCode: 405, body: "Method Not Allowed" };
+    }
+
+    // Parse the body
+    const { pdf, fileName } = JSON.parse(event.body);
+    
+    // Create temp directory
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-processing-'));
+    const tempFilePath = path.join(tempDir, fileName);
+    
+    // Write the base64 PDF to a temp file
+    const buffer = Buffer.from(pdf, 'base64');
+    await writeFile(tempFilePath, buffer);
+    
+    // Process the PDF
+    const loader = new PDFLoader(tempFilePath);
+    const docs = await loader.load();
+    
+    // Split the text
+    const textSplitter = new RecursiveCharacterTextSplitter({
+      chunkSize: 1000,
+      chunkOverlap: 100,
+    });
+    const splits = await textSplitter.splitDocuments(docs);
+    
+    // Create embeddings and store in FAISS
+    // Using HuggingFace transformers for embeddings instead of OpenAI
+    const embeddings = new HuggingFaceTransformersEmbeddings({
+      modelName: "sentence-transformers/all-MiniLM-L6-v2", // Lightweight, efficient model
+    });
+    
+    const vectorStore = await FaissStore.fromDocuments(splits, embeddings);
+    
+    // Save the vector store to a directory that's accessible
+    const vectorStorePath = path.join(tempDir, 'vectorstore');
+    await mkdir(vectorStorePath, { recursive: true });
+    await vectorStore.save(vectorStorePath);
+    
+    // Clean up temporary PDF file
+    await unlink(tempFilePath);
+    
+    return {
+      statusCode: 200,
+      body: JSON.stringify({
+        success: true,
+        message: `Successfully processed ${fileName}`,
+        vectorStorePath: vectorStorePath,
+        chunkCount: splits.length
+      })
+    };
+  } catch (error) {
+    console.error("Error processing PDF:", error);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ success: false, error: error.message })
+    };
+  }
+};
+
+// netlify/functions/query-rag.js
+// This serverless function will handle RAG queries
+const { ChatGroq } = require("langchain/chat_models/groq");
+const { FaissStore } = require("langchain/vectorstores/faiss");
+const { HuggingFaceTransformersEmbeddings } = require("langchain/embeddings/hf_transformers");
+const { PromptTemplate } = require("langchain/prompts");
+const { RunnablePassthrough, RunnableSequence } = require("langchain/schema/runnable");
+const { StringOutputParser } = require("langchain/schema/output_parser");
+const { generatePrompt } = require('./prompt-utils'); // We'll create this helper
+
+exports.handler = async (event, context) => {
+  try {
+    if (event.httpMethod !== "POST") {
+      return { statusCode: 405, body: "Method Not Allowed" };
+    }
+
+    // Parse the request
+    const { question, vectorStorePath, modelName, groqApiKey, learningStyle, complexityLevel, includeExamples, includeAnalogies, includeQuestions } = JSON.parse(event.body);
+    
+    // Load the vector store with Hugging Face embeddings
+    const embeddings = new HuggingFaceTransformersEmbeddings({
+      modelName: "sentence-transformers/all-MiniLM-L6-v2",
+    });
+    
+    const vectorStore = await FaissStore.load(vectorStorePath, embeddings);
+    const retriever = vectorStore.asRetriever(5); // Use top 5 results
+    
+    // Set up the LLM
+    const llm = new ChatGroq({ 
+      apiKey: groqApiKey,
+      modelName: modelName || "llama3-70b-8192",
+    });
+    
+    // Create a template with user preferences
+    const template = generatePrompt(learningStyle, complexityLevel, includeExamples, includeAnalogies, includeQuestions);
+    const prompt = PromptTemplate.fromTemplate(template);
+    
+    // Create the chain
+    const chain = RunnableSequence.from([
+      {
+        context: retriever.pipe(docs => docs.map(doc => doc.pageContent).join("\n\n")),
+        question: new RunnablePassthrough(),
+        learningStyle: () => learningStyle,
+        complexityLevel: () => complexityLevel
+      },
+      prompt,
+      llm,
+      new StringOutputParser()
+    ]);
+    
+    // Execute the chain
+    const response = await chain.invoke(question);
+    
+    return {
+      statusCode: 200,
+      body: JSON.stringify({
+        success: true,
+        answer: response
+      })
+    };
+  } catch (error) {
+    console.error("Error querying RAG:", error);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ success: false, error: error.message })
+    };
+  }
+};
+
+// netlify/functions/prompt-utils.js
+// Helper for creating prompts based on user preferences
+exports.generatePrompt = (learningStyle, complexityLevel, includeExamples, includeAnalogies, includeQuestions) => {
+  // Base prompt
+  let prompt = `
+  You are an expert educational assistant helping students learn effectively.
+  
+  Learning Style: {learningStyle}
+  Content Level: {complexityLevel}
+  
+  Use the following context from textbooks to answer the question:
+  {context}
+  
+  Question: {question}
+  
+  Instructions:
+  - Provide a clear, concise explanation
+  - Use language appropriate for the {complexityLevel} level
+  `;
+  
+  // Add additional instructions based on preferences
+  if (learningStyle === "Visual") {
+    prompt += "- Include descriptions that help create mental images\n- Use spatial arrangements and patterns in explanations\n";
+  } else if (learningStyle === "Auditory") {
+    prompt += "- Use rhythm and flow in explanations\n- Include memorable phrases and verbal cues\n";
+  } else if (learningStyle === "Read/Write") {
+    prompt += "- Focus on clear text explanations with logical flow\n- Use lists and definitions where appropriate\n";
+  } else if (learningStyle === "Kinesthetic") {
+    prompt += "- Include practical applications and hands-on connections\n- Connect concepts to physical experiences\n";
+  }
+  
+  if (includeExamples) {
+    prompt += "- Include 1-2 relevant examples that illustrate the concept\n";
+  }
+  
+  if (includeAnalogies) {
+    prompt += "- Provide a helpful analogy to make the concept more relatable\n";
+  }
+  
+  if (includeQuestions) {
+    prompt += "- End with 1-2 practice questions to reinforce understanding\n";
+  }
+  
+  return prompt;
+};
+
+// src/App.js
+import React, { useState } from 'react';
+import './App.css';
+
+function App() {
+  const [files, setFiles] = useState([]);
+  const [uploadedFiles, setUploadedFiles] = useState([]);
+  const [vectorStorePath, setVectorStorePath] = useState(null);
+  const [processing, setProcessing] = useState(false);
+  const [question, setQuestion] = useState('');
+  const [answer, setAnswer] = useState('');
+  const [topic, setTopic] = useState('');
+  const [studyGuide, setStudyGuide] = useState('');
+  const [querying, setQuerying] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [activeTab, setActiveTab] = useState('ask');
+  const [apiKeys, setApiKeys] = useState({
+    groq: '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'
+  });
+  const [settings, setSettings] = useState({
+    model: 'llama3-70b-8192',
+    learningStyle: 'Balanced',
+    complexityLevel: 'Intermediate',
+    includeExamples: true,
+    includeAnalogies: true,
+    includeQuestions: true
+  });
+
+  const handleFileChange = (e) => {
+    setFiles([...e.target.files]);
+  };
+
+  const processFiles = async () => {
+    if (files.length === 0) {
+      alert('Please select files to process');
+      return;
+    }
+
+    setProcessing(true);
+    const processedFiles = [];
+
+    try {
+      for (const file of files) {
+        const reader = new FileReader();
+        const fileContent = await new Promise((resolve) => {
+          reader.onload = (e) => resolve(e.target.result);
+          reader.readAsDataURL(file);
+        });
+        
+        // Extract base64 content
+        const base64Content = fileContent.split(',')[1];
+        
+        const response = await fetch('/.netlify/functions/process-pdf', {
+          method: 'POST',
+          body: JSON.stringify({
+            pdf: base64Content,
+            fileName: file.name
+          })
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+          processedFiles.push(file.name);
+          setVectorStorePath(result.vectorStorePath);
+        }
+      }
+      
+      setUploadedFiles([...uploadedFiles, ...processedFiles]);
+      setFiles([]);
+    } catch (error) {
+      console.error('Error processing files:', error);
+      alert(`Error processing files: ${error.message}`);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const askQuestion = async () => {
+    if (!question || !vectorStorePath || !apiKeys.groq) {
+      alert('Please process textbooks first and ensure Groq API key is entered');
+      return;
+    }
+
+    setQuerying(true);
+    
+    try {
+      const response = await fetch('/.netlify/functions/query-rag', {
+        method: 'POST',
+        body: JSON.stringify({
+          question,
+          vectorStorePath,
+          modelName: settings.model,
+          groqApiKey: apiKeys.groq,
+          learningStyle: settings.learningStyle,
+          complexityLevel: settings.complexityLevel,
+          includeExamples: settings.includeExamples,
+          includeAnalogies: settings.includeAnalogies,
+          includeQuestions: settings.includeQuestions
+        })
+      });
+      
+      const result = await response.json();
+      
+      if (result.success) {
+        setAnswer(result.answer);
+      } else {
+        alert(`Error: ${result.error}`);
+      }
+    } catch (error) {
+      console.error('Error querying RAG:', error);
+      alert(`Error querying RAG: ${error.message}`);
+    } finally {
+      setQuerying(false);
+    }
+  };
+
+  const generateStudyGuide = async () => {
+    if (!topic || !vectorStorePath || !apiKeys.groq) {
+      alert('Please process textbooks first and ensure Groq API key is entered');
+      return;
+    }
+
+    setGenerating(true);
+    
+    try {
+      const response = await fetch('/.netlify/functions/query-rag', {
+        method: 'POST',
+        body: JSON.stringify({
+          question: `Create a study guide on ${topic}.`,
+          vectorStorePath,
+          modelName: settings.model,
+          groqApiKey: apiKeys.groq,
+          learningStyle: settings.learningStyle,
+          complexityLevel: settings.complexityLevel,
+          includeExamples: settings.includeExamples,
+          includeAnalogies: settings.includeAnalogies,
+          includeQuestions: settings.includeQuestions
+        })
+      });
+      
+      const result = await response.json();
+      
+      if (result.success) {
+        setStudyGuide(result.answer);
+      } else {
+        alert(`Error: ${result.error}`);
+      }
+    } catch (error) {
+      console.error('Error generating study guide:', error);
+      alert(`Error generating study guide: ${error.message}`);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const resetApp = () => {
+    setFiles([]);
+    setUploadedFiles([]);
+    setVectorStorePath(null);
+    setQuestion('');
+    setAnswer('');
+    setTopic('');
+    setStudyGuide('');
+  };
+
+  return (
+    <div className="app">
+      <header>
+        <h1>📚 Smart Study Assistant</h1>
+        <p>Upload your textbooks and get personalized learning content</p>
+      </header>
+
+      <div className="main-container">
+        <aside className="sidebar">
+          <div className="section">
+            <h2>Configuration</h2>
+            <div className="form-group">
+              <label>Groq API Key:</label>
+              <input 
+                type="password" 
+                value={apiKeys.groq} 
+                onChange={(e) => setApiKeys({...apiKeys, groq: e.target.value})} 
+                placeholder="gsk-..." 
+              />
+              <small>Pre-configured with demo key</small>
+            </div>
+            
+            <div className="form-group">
+              <label>Select Groq Model:</label>
+              <select 
+                value={settings.model} 
+                onChange={(e) => setSettings({...settings, model: e.target.value})}
+              >
+                <option value="llama3-70b-8192">llama3-70b-8192</option>
+                <option value="llama3-8b-8192">llama3-8b-8192</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="section">
+            <h2>Uploaded Textbooks</h2>
+            {uploadedFiles.length === 0 ? (
+              <p>No textbooks uploaded yet</p>
+            ) : (
+              <ul>
+                {uploadedFiles.map((file, index) => (
+                  <li key={index}>{file}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="section">
+            <h2>Learning Preferences</h2>
+            <div className="form-group">
+              <label>Learning Style:</label>
+              <select 
+                value={settings.learningStyle} 
+                onChange={(e) => setSettings({...settings, learningStyle: e.target.value})}
+              >
+                <option value="Visual">Visual</option>
+                <option value="Auditory">Auditory</option>
+                <option value="Read/Write">Read/Write</option>
+                <option value="Kinesthetic">Kinesthetic</option>
+                <option value="Balanced">Balanced</option>
+              </select>
+            </div>
+            
+            <div className="form-group">
+              <label>Content Complexity:</label>
+              <select 
+                value={settings.complexityLevel} 
+                onChange={(e) => setSettings({...settings, complexityLevel: e.target.value})}
+              >
+                <option value="Beginner">Beginner</option>
+                <option value="Intermediate">Intermediate</option>
+                <option value="Advanced">Advanced</option>
+                <option value="Expert">Expert</option>
+              </select>
+            </div>
+            
+            <div className="form-group">
+              <label>
+                <input 
+                  type="checkbox" 
+                  checked={settings.includeExamples} 
+                  onChange={(e) => setSettings({...settings, includeExamples: e.target.checked})} 
+                />
+                Include examples in answers
+              </label>
+            </div>
+            
+            <div className="form-group">
+              <label>
+                <input 
+                  type="checkbox" 
+                  checked={settings.includeAnalogies} 
+                  onChange={(e) => setSettings({...settings, includeAnalogies: e.target.checked})} 
+                />
+                Include analogies in answers
+              </label>
+            </div>
+            
+            <div className="form-group">
+              <label>
+                <input 
+                  type="checkbox" 
+                  checked={settings.includeQuestions} 
+                  onChange={(e) => setSettings({...settings, includeQuestions: e.target.checked})} 
+                />
+                Include practice questions
+              </label>
+            </div>
+          </div>
+        </aside>
+
+        <main className="content">
+          <section className="upload-section">
+            <h2>Upload Your Textbooks</h2>
+            <div className="upload-container">
+              <input 
+                type="file" 
+                accept=".pdf" 
+                multiple 
+                onChange={handleFileChange} 
+                disabled={processing}
+              />
+              <button 
+                onClick={processFiles} 
+                disabled={files.length === 0 || processing}
+                className="primary-button"
+              >
+                {processing ? 'Processing...' : 'Process Textbooks'}
+              </button>
+            </div>
+            {files.length > 0 && (
+              <div className="selected-files">
+                <h3>Selected Files:</h3>
+                <ul>
+                  {Array.from(files).map((file, index) => (
+                    <li key={index}>{file.name}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </section>
+
+          <section className="learning-section">
+            <h2>Learn From Your Textbooks</h2>
+            
+            <div className="tabs">
+              <button 
+                className={activeTab === 'ask' ? 'active' : ''} 
+                onClick={() => setActiveTab('ask')}
+              >
+                Ask Questions
+              </button>
+              <button 
+                className={activeTab === 'study' ? 'active' : ''} 
+                onClick={() => setActiveTab('study')}
+              >
+                Study Guide Generator
+              </button>
+            </div>
+            
+            <div className="tab-content">
+              {activeTab === 'ask' ? (
+                <div className="ask-tab">
+                  <div className="form-group">
+                    <label>What would you like to learn about?</label>
+                    <input 
+                      type="text" 
+                      value={question} 
+                      onChange={(e) => setQuestion(e.target.value)} 
+                      placeholder="Enter your question here..."
+                      disabled={!vectorStorePath || querying}
+                    />
+                    <button 
+                      onClick={askQuestion} 
+                      disabled={!question || !vectorStorePath || querying}
+                      className="primary-button"
+                    >
+                      {querying ? 'Finding answer...' : 'Get Answer'}
+                    </button>
+                  </div>
+                  
+                  {answer && (
+                    <div className="answer">
+                      <h3>Answer:</h3>
+                      <div className="answer-content">
+                        {answer.split('\n').map((line, i) => (
+                          <p key={i}>{line}</p>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="study-tab">
+                  <div className="form-group">
+                    <label>Topic for study guide:</label>
+                    <input 
+                      type="text" 
+                      value={topic} 
+                      onChange={(e) => setTopic(e.target.value)} 
+                      placeholder="Enter topic here..."
+                      disabled={!vectorStorePath || generating}
+                    />
+                    <button 
+                      onClick={generateStudyGuide} 
+                      disabled={!topic || !vectorStorePath || generating}
+                      className="primary-button"
+                    >
+                      {generating ? 'Generating...' : 'Generate Study Guide'}
+                    </button>
+                  </div>
+                  
+                  {studyGuide && (
+                    <div className="study-guide">
+                      <h3>Study Guide:</h3>
+                      <div className="study-guide-content">
+                        {studyGuide.split('\n').map((line, i) => (
+                          <p key={i}>{line}</p>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+          
+          <button 
+            onClick={resetApp} 
+            className="reset-button"
+          >
+            Reset App
+          </button>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+export default App;
+
+// package.json
+{
+  "name": "smart-study-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^5.16.5",
+    "@testing-library/react": "^13.4.0",
+    "@testing-library/user-event": "^13.5.0",
+    "langchain": "^0.0.267",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1",
+    "web-vitals": "^2.1.4",
+    "@huggingface/inference": "^2.6.1",
+    "faiss-node": "^0.5.1",
+    "pdf-parse": "^1.1.1"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject",
+    "dev": "netlify dev"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "netlify-cli": "^15.0.0"
+  }
+}
+
+// netlify.toml
+[build]
+  command = "npm run build"
+  publish = "build"
+  functions = "netlify/functions"
+
+[dev]
+  command = "npm run start"
+  port = 8888
+  publish = "build"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = ["pdf-parse", "@huggingface/inference", "faiss-node"]
